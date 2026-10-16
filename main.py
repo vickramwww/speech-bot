@@ -202,7 +202,7 @@ class AudioProcessor:
                 samplerate=self.rate,
                 channels=self.channels,
                 dtype=self.dtype,
-                blocksize=self.playback_blocksize,
+                blocksize=self.playback_blocksize,  # 0 = let PortAudio choose
             )
             self.output_stream.start()
 
@@ -222,11 +222,13 @@ class AudioProcessor:
         """Audio playback thread - runs in background."""
         while self.is_playing:
             try:
-                # Get audio data from queue (blocking with timeout)
-                audio_data = self.audio_queue.get(timeout=5.0)
+                audio_data = self.audio_queue.get(timeout=0.5)
 
-                if audio_data and self.output_stream and self.is_playing:
-                    # Convert bytes to numpy array for sounddevice
+                # None is the stop sentinel
+                if audio_data is None:
+                    break
+
+                if self.output_stream and self.is_playing:
                     audio_array = np.frombuffer(audio_data, dtype=np.int16).reshape(-1, self.channels)
                     self.output_stream.write(audio_array)
 
@@ -235,7 +237,6 @@ class AudioProcessor:
             except Exception as e:
                 if self.is_playing:
                     logger.error(f"Error in audio playback: {e}")
-                self.is_playing = False
                 break
 
     async def queue_audio(self, audio_data: bytes):
@@ -250,20 +251,26 @@ class AudioProcessor:
 
         self.is_playing = False
 
-        # Clear the queue
+        # Wake the playback thread immediately via sentinel
+        self.audio_queue.put(None)
+
+        # Clear remaining queued audio
         while not self.audio_queue.empty():
             try:
                 self.audio_queue.get_nowait()
             except queue.Empty:
                 break
 
+        if self.playback_thread:
+            # Run join off the event loop so we don't block incoming events
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.playback_thread.join, 2.0)
+            self.playback_thread = None
+
         if self.output_stream:
             self.output_stream.stop()
             self.output_stream.close()
             self.output_stream = None
-
-        if self.playback_thread:
-            self.playback_thread.join(timeout=5.0)
 
         logger.info("Stopped audio playback")
 
@@ -325,7 +332,6 @@ class BasicVoiceAssistant:
 
                 # Start audio systems
                 await ap.start_playback()
-                await ap.start_capture()
 
                 logger.info("Voice assistant ready! Start speaking...")
                 print("\n" + "=" * 60)
