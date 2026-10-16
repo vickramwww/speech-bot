@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Voice Assistant</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f0f0f;
+      color: #fff;
+      height: 100vh;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 32px;
+      padding: 24px;
+    }
+
+    h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: -0.02em; color: #e5e5e5; }
+
+    #status {
+      font-size: 0.95rem;
+      color: #888;
+      min-height: 1.4em;
+      text-align: center;
+      transition: color 0.2s;
+    }
+    #status.active { color: #4ade80; }
+    #status.error  { color: #f87171; }
+
+    #btn {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      border: none;
+      background: #1d1d1d;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.2s, transform 0.1s, box-shadow 0.2s;
+      box-shadow: 0 0 0 4px #2a2a2a;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #btn:active { transform: scale(0.95); }
+    #btn.listening {
+      background: #15803d;
+      box-shadow: 0 0 0 8px rgba(21, 128, 61, 0.3), 0 0 0 16px rgba(21, 128, 61, 0.12);
+      animation: pulse-green 1.5s infinite;
+    }
+    #btn.speaking {
+      background: #1d4ed8;
+      box-shadow: 0 0 0 8px rgba(29, 78, 216, 0.3), 0 0 0 16px rgba(29, 78, 216, 0.12);
+      animation: pulse-blue 1.5s infinite;
+    }
+    #btn svg { pointer-events: none; }
+
+    @keyframes pulse-green {
+      0%, 100% { box-shadow: 0 0 0 8px rgba(21,128,61,.3), 0 0 0 16px rgba(21,128,61,.12); }
+      50%       { box-shadow: 0 0 0 14px rgba(21,128,61,.4), 0 0 0 26px rgba(21,128,61,.06); }
+    }
+    @keyframes pulse-blue {
+      0%, 100% { box-shadow: 0 0 0 8px rgba(29,78,216,.3), 0 0 0 16px rgba(29,78,216,.12); }
+      50%       { box-shadow: 0 0 0 14px rgba(29,78,216,.4), 0 0 0 26px rgba(29,78,216,.06); }
+    }
+
+    #hint { font-size: 0.8rem; color: #555; text-align: center; max-width: 260px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>Voice Assistant</h1>
+  <div id="status">Connecting…</div>
+
+  <button id="btn" disabled title="Start / Stop">
+    <svg id="icon-mic" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#ccc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+      <line x1="12" y1="19" x2="12" y2="23"/>
+      <line x1="8"  y1="23" x2="16" y2="23"/>
+    </svg>
+  </button>
+
+  <div id="hint">Tap the button to start talking.<br/>Release to let the AI respond.</div>
+
+  <script>
+  (() => {
+    const btn    = document.getElementById('btn');
+    const status = document.getElementById('status');
+
+    let ws, audioCtx, workletNode, micStream, sourceNode;
+    let isListening = false;
+    let playQueue   = [];
+    let isPlaying   = false;
+
+    // ── WebSocket setup ───────────────────────────────────────────────────────
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+      ws.onopen = () => setStatus('Connected — tap to talk', false);
+
+      ws.onmessage = async ({ data }) => {
+        const msg = JSON.parse(data);
+        if (msg.type === 'audio')   { enqueueAudio(msg.data); }
+        if (msg.type === 'status')  { handleStatus(msg.message); }
+        if (msg.type === 'error')   { setStatus('Error: ' + msg.message, true); }
+      };
+
+      ws.onclose = () => {
+        setStatus('Disconnected — reload to reconnect', true);
+        btn.disabled = true;
+        setTimeout(connect, 3000); // auto-reconnect
+      };
+
+      ws.onerror = () => setStatus('Connection error', true);
+    }
+
+    async function handleStatus(s) {
+      const map = {
+        ready:        'Ready — tap to talk',
+        listening:    'Listening…',
+        processing:   'Thinking…',
+        speaking_done:'Tap to talk',
+      };
+      setStatus(map[s] ?? s, s === 'ready' || s === 'speaking_done');
+      if (s === 'ready') {
+        await ensureMicReady();
+        btn.disabled = false;
+      }
+    }
+
+    function setStatus(text, ok) {
+      status.textContent = text;
+      status.className   = ok ? 'active' : (text.toLowerCase().includes('error') ? 'error' : '');
+    }
+
+    // ── Audio playback queue ──────────────────────────────────────────────────
+    function enqueueAudio(b64) {
+      const raw  = atob(b64);
+      const i16  = new Int16Array(raw.length / 2);
+      for (let i = 0; i < i16.length; i++)
+        i16[i] = (raw.charCodeAt(i * 2)) | (raw.charCodeAt(i * 2 + 1) << 8);
+
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+
+      playQueue.push(f32);
+      if (!isPlaying) {
+        btn.classList.add('speaking');
+        drainQueue();
+      }
+    }
+
+    function drainQueue() {
+      if (!playQueue.length || !audioCtx) {
+        isPlaying = false;
+        btn.classList.remove('speaking');
+        return;
+      }
+      isPlaying = true;
+
+      const f32    = playQueue.shift();
+      const buf    = audioCtx.createBuffer(1, f32.length, 24000);
+      buf.getChannelData(0).set(f32);
+
+      const src    = audioCtx.createBufferSource();
+      src.buffer   = buf;
+      src.connect(audioCtx.destination);
+      src.onended  = drainQueue;
+      src.start();
+    }
+
+    function clearQueue() {
+      playQueue = [];
+      isPlaying = false;
+      btn.classList.remove('speaking');
+    }
+
+    // ── Mic setup — called once when session is ready ─────────────────────────
+    let micReady = false;
+
+    async function ensureMicReady() {
+      if (micReady) return;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { channelCount: 1, sampleRate: 24000, echoCancellation: true, noiseSuppression: true },
+        });
+      } catch (e) {
+        setStatus('Mic permission denied', true);
+        return;
+      }
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+      await audioCtx.audioWorklet.addModule('/static/pcm-worklet.js');
+
+      sourceNode  = audioCtx.createMediaStreamSource(micStream);
+      workletNode = new AudioWorkletNode(audioCtx, 'pcm-capture');
+
+      workletNode.port.onmessage = ({ data }) => {
+        if (!isListening || ws?.readyState !== WebSocket.OPEN) return;
+        const bytes = new Uint8Array(data);
+        let b64 = '';
+        for (let i = 0; i < bytes.length; i++) b64 += String.fromCharCode(bytes[i]);
+        ws.send(JSON.stringify({ type: 'audio', data: btoa(b64) }));
+      };
+
+      sourceNode.connect(workletNode);
+      micReady = true;
+    }
+
+    // ── Button interaction ────────────────────────────────────────────────────
+    async function onPress() {
+      if (isListening) return;
+      // Resume AudioContext if suspended (required on iOS after a period of inactivity)
+      if (audioCtx?.state === 'suspended') await audioCtx.resume();
+      isListening = true;
+      btn.classList.add('listening');
+      setStatus('Listening…', true);
+      clearQueue();
+    }
+
+    function onRelease() {
+      if (!isListening) return;
+      isListening = false;
+      btn.classList.remove('listening');
+      setStatus('Thinking…', false);
+    }
+
+    btn.addEventListener('pointerdown',  onPress);
+    btn.addEventListener('pointerup',    onRelease);
+    btn.addEventListener('pointerleave', onRelease);
+
+    // Prevent context menu on long-press (mobile)
+    btn.addEventListener('contextmenu', e => e.preventDefault());
+
+    connect();
+  })();
+  </script>
+</body>
+</html>

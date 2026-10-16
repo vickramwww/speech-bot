@@ -1,0 +1,7 @@
+azure-ai-voicelive
+azure-identity
+azure-core
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
